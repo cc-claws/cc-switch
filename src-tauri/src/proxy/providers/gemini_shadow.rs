@@ -90,6 +90,11 @@ impl GeminiShadowSession {
 struct GeminiShadowInner {
     sessions: HashMap<GeminiShadowKey, GeminiShadowSession>,
     session_order: VecDeque<GeminiShadowKey>,
+    /// Provider-scoped recent turns (aggregated across all sessions of a
+    /// provider). Recovered when a session-scoped lookup misses because the
+    /// client session id is unstable, so thought_signature replay state can
+    /// still be restored.
+    provider_recent: HashMap<String, VecDeque<GeminiAssistantTurn>>,
 }
 
 impl GeminiShadowInner {
@@ -97,6 +102,7 @@ impl GeminiShadowInner {
         Self {
             sessions: HashMap::new(),
             session_order: VecDeque::new(),
+            provider_recent: HashMap::new(),
         }
     }
 }
@@ -159,6 +165,23 @@ impl GeminiShadowStore {
             }
             Self::snapshot_session(&key, session)
         };
+
+        // Keep the provider-scoped recent-turns bucket in sync (LRU across all
+        // sessions of this provider). When the client session id is unstable,
+        // `get_session` misses and this bucket restores thought_signature replay
+        // state so replayed functionCalls still carry their signature.
+        if let Some(latest_turn) = snapshot.turns.last() {
+            let provider_id = &key.provider_id;
+            let bucket = inner
+                .provider_recent
+                .entry(provider_id.clone())
+                .or_insert_with(VecDeque::new);
+            bucket.push_back(latest_turn.clone());
+            while bucket.len() > self.max_turns_per_session {
+                bucket.pop_front();
+            }
+        }
+
         Self::prune_sessions(&mut inner, self.max_sessions);
         snapshot
     }
@@ -202,6 +225,23 @@ impl GeminiShadowStore {
             Self::touch_session_order(&mut inner.session_order, &key);
         }
         snapshot
+    }
+
+    /// Read the most recent assistant turns across all sessions of a provider.
+    ///
+    /// This is the fallback for session-scoped lookups when the client session
+    /// id is unstable (a session key recorded earlier no longer matches the
+    /// follow-up request). Replaying these turns still lets the transform layer
+    /// rebuild its `thought_signature` map keyed by `tool_call.id`.
+    pub fn get_recent_turns(&self, provider_id: &str) -> Vec<GeminiAssistantTurn> {
+        let inner = self.read_inner();
+        inner
+            .provider_recent
+            .get(provider_id)
+            .cloned()
+            .unwrap_or_default()
+            .into_iter()
+            .collect()
     }
 
     /// Remove a single session from the store.
@@ -395,5 +435,70 @@ mod tests {
         assert_eq!(removed, 1);
         assert!(store.get_session("provider-a", "session-2").is_none());
         assert!(store.get_session("provider-b", "session-3").is_some());
+    }
+
+    #[test]
+    fn get_recent_turns_aggregates_across_sessions() {
+        let store = GeminiShadowStore::with_limits(8, 4);
+
+        store.record_assistant_turn(
+            "provider-a",
+            "session-1",
+            json!({"parts": [{"text": "first", "thought_signature": "sig-1"}]}),
+            vec![GeminiToolCallMeta::new(
+                Some("call-1"),
+                "get_weather",
+                json!({"location": "Tokyo"}),
+                Some("sig-1"),
+            )],
+        );
+        store.record_assistant_turn(
+            "provider-a",
+            "session-2",
+            json!({"parts": [{"text": "second", "thought_signature": "sig-2"}]}),
+            vec![GeminiToolCallMeta::new(
+                Some("call-2"),
+                "search",
+                json!({"q": "alpha"}),
+                Some("sig-2"),
+            )],
+        );
+        // 其他 provider 的 turns 不应混入
+        store.record_assistant_turn("provider-b", "session-1", json!({"text": "other"}), vec![]);
+
+        let turns = store.get_recent_turns("provider-a");
+        assert_eq!(turns.len(), 2);
+        let sigs: Vec<_> = turns
+            .iter()
+            .flat_map(|t| t.tool_calls.iter().filter_map(|c| c.thought_signature.as_deref()))
+            .collect();
+        assert!(sigs.contains(&"sig-1"));
+        assert!(sigs.contains(&"sig-2"));
+    }
+
+    #[test]
+    fn get_recent_turns_recovers_signature_when_session_misses() {
+        let store = GeminiShadowStore::with_limits(8, 4);
+        store.record_assistant_turn(
+            "provider-a",
+            "session-1",
+            json!({"parts": [{"text": "hi", "thought_signature": "sig-1"}]}),
+            vec![GeminiToolCallMeta::new(
+                Some("call-1"),
+                "get_weather",
+                json!({"location": "Tokyo"}),
+                Some("sig-1"),
+            )],
+        );
+
+        // 模拟 session 抖动：后续请求换了一个从未见过的 session_id
+        assert!(store.get_session("provider-a", "session-bogus").is_none());
+
+        // provider 维度仍能取回最近的 turns（含签名），供回放恢复
+        let turns = store.get_recent_turns("provider-a");
+        assert_eq!(turns.len(), 1);
+        let tool_call = &turns[0].tool_calls[0];
+        assert_eq!(tool_call.id.as_deref(), Some("call-1"));
+        assert_eq!(tool_call.thought_signature.as_deref(), Some("sig-1"));
     }
 }

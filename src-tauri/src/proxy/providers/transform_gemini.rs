@@ -58,12 +58,23 @@ pub fn anthropic_to_gemini_with_shadow(
     session_id: Option<&str>,
 ) -> Result<Value, ProxyError> {
     let mut result = json!({});
-    let shadow_turns = shadow_store
+    let mut shadow_turns = shadow_store
         .zip(provider_id)
         .zip(session_id)
         .and_then(|((store, provider_id), session_id)| store.get_session(provider_id, session_id))
         .map(|snapshot| snapshot.turns)
         .unwrap_or_default();
+    // Fallback: when the client session id is unstable, `get_session` misses and
+    // the shadow turns (and their thought_signatures) are lost. Recover the most
+    // recent turns of this provider so replayed functionCalls still carry their
+    // signature and upstream does not reject with 400 (missing/unknown signature).
+    if shadow_turns.is_empty() {
+        if let Some(provider_id) = provider_id {
+            shadow_turns = shadow_store
+                .map(|store| store.get_recent_turns(provider_id))
+                .unwrap_or_default();
+        }
+    }
     let supports_multimodal_function_response = body
         .get("model")
         .and_then(Value::as_str)
@@ -684,14 +695,16 @@ fn convert_message_content_to_parts(
                 // Re-attach the thought_signature that Gemini originally
                 // associated with this functionCall.  The Anthropic format
                 // strips it from the tool_use block, but Gemini requires it
-                // on every functionCall in a multi-turn tool-use exchange.
-                // Without replaying the stored signature the upstream may
-                // reject with "missing a `thought_signature`".
+                // as a Part-level field (a sibling of `functionCall`), NOT
+                // inside the FunctionCall message itself. Putting it inside
+                // function_call triggers:
+                //   `400 Unknown name "thought_signature" ...function_call: Cannot find field.`
+                let mut part = json!({ "functionCall": function_call });
                 if let Some(sig) = thought_signature_by_id.get(id) {
-                    function_call["thoughtSignature"] = json!(sig);
+                    part["thought_signature"] = json!(sig);
                 }
 
-                parts.push(json!({ "functionCall": function_call }));
+                parts.push(part);
             }
             "tool_result" => {
                 let tool_use_id = block
@@ -1135,8 +1148,8 @@ fn extract_tool_call_meta(parts: &[Value]) -> Vec<GeminiToolCallMeta> {
                     .get("args")
                     .cloned()
                     .unwrap_or_else(|| json!({})),
-                part.get("thoughtSignature")
-                    .or_else(|| part.get("thought_signature"))
+                part.get("thought_signature")
+                    .or_else(|| part.get("thoughtSignature"))
                     .and_then(|value| value.as_str()),
             ))
         })
@@ -2005,7 +2018,7 @@ mod tests {
                         "name": "Bash",
                         "args": { "command": "ls -R" }
                     },
-                    "thoughtSignature": "sig-tool-1"
+                    "thought_signature": "sig-tool-1"
                 }]
             }),
             vec![GeminiToolCallMeta::new(
@@ -2053,7 +2066,7 @@ mod tests {
             "Bash"
         );
         assert_eq!(
-            result["contents"][0]["parts"][0]["thoughtSignature"],
+            result["contents"][0]["parts"][0]["thought_signature"],
             "sig-tool-1"
         );
     }
@@ -2077,7 +2090,7 @@ mod tests {
                         "name": "server_a:search",
                         "args": { "q": "alpha" }
                     },
-                    "thoughtSignature": "sig-a"
+                    "thought_signature": "sig-a"
                 }]
             }),
             vec![GeminiToolCallMeta::new(
@@ -2097,7 +2110,7 @@ mod tests {
                         "name": "server_b:search",
                         "args": { "q": "beta" }
                     },
-                    "thoughtSignature": "sig-b"
+                    "thought_signature": "sig-b"
                 }]
             }),
             vec![GeminiToolCallMeta::new(
@@ -2151,7 +2164,7 @@ mod tests {
             "server_b:search"
         );
         assert_eq!(
-            result["contents"][0]["parts"][0]["thoughtSignature"],
+            result["contents"][0]["parts"][0]["thought_signature"],
             "sig-b"
         );
         // msg[2] replays shadow turn 0 (server_a:search) because id=call_a,
@@ -2161,7 +2174,7 @@ mod tests {
             "server_a:search"
         );
         assert_eq!(
-            result["contents"][2]["parts"][0]["thoughtSignature"],
+            result["contents"][2]["parts"][0]["thought_signature"],
             "sig-a"
         );
     }
@@ -2181,7 +2194,7 @@ mod tests {
                         "name": "lookup",
                         "args": {}
                     },
-                    "thoughtSignature": "sig-lookup"
+                    "thought_signature": "sig-lookup"
                 }]
             }),
             vec![GeminiToolCallMeta::new(
@@ -2220,7 +2233,7 @@ mod tests {
             "lookup"
         );
         assert_eq!(
-            result["contents"][0]["parts"][0]["thoughtSignature"],
+            result["contents"][0]["parts"][0]["thought_signature"],
             "sig-lookup"
         );
     }
