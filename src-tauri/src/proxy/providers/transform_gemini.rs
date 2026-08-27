@@ -58,29 +58,48 @@ pub fn anthropic_to_gemini_with_shadow(
     session_id: Option<&str>,
 ) -> Result<Value, ProxyError> {
     let mut result = json!({});
+    let messages = body.get("messages").and_then(|value| value.as_array());
     let mut shadow_turns = shadow_store
         .zip(provider_id)
         .zip(session_id)
         .and_then(|((store, provider_id), session_id)| store.get_session(provider_id, session_id))
         .map(|snapshot| snapshot.turns)
         .unwrap_or_default();
-    // Fallback: when the client session id is unstable, `get_session` misses and
-    // the shadow turns (and their thought_signatures) are lost. Recover the most
-    // recent turns of this provider so replayed functionCalls still carry their
-    // signature and upstream does not reject with 400 (missing/unknown signature).
+    // Fallback: when the client session id is unstable, `get_session` misses
+    // and the shadow turns (and their thought_signatures) are lost. Recover the
+    // most recent turns of this provider — but scope them back to THIS
+    // conversation first. The provider-wide bucket aggregates every session, so
+    // feeding it in raw would let `convert_messages_to_contents` select another
+    // conversation's turn by tool name or position and leak its assistant
+    // content + thought signature upstream. Tool-call ids referenced in the
+    // request are a stable, globally-unique conversation key, so keep only the
+    // turns that recorded one of those ids.
     if shadow_turns.is_empty() {
         if let Some(provider_id) = provider_id {
-            shadow_turns = shadow_store
+            let recent_turns = shadow_store
                 .map(|store| store.get_recent_turns(provider_id))
                 .unwrap_or_default();
+            if !recent_turns.is_empty() {
+                let request_tool_ids = collect_request_tool_ids(messages.map(Vec::as_slice));
+                if !request_tool_ids.is_empty() {
+                    shadow_turns = recent_turns
+                        .into_iter()
+                        .filter(|turn| {
+                            turn.tool_calls.iter().any(|call| {
+                                call.id
+                                    .as_deref()
+                                    .is_some_and(|id| request_tool_ids.contains(id))
+                            })
+                        })
+                        .collect();
+                }
+            }
         }
     }
     let supports_multimodal_function_response = body
         .get("model")
         .and_then(Value::as_str)
         .is_some_and(is_gemini_3_series);
-
-    let messages = body.get("messages").and_then(|value| value.as_array());
 
     let system_instruction = build_system_instruction(
         body.get("system"),
@@ -542,6 +561,48 @@ fn find_matching_shadow_turn_for_assistant_message(
             })
             .then_some(index)
     })
+}
+
+/// Collect every tool-call id referenced in the request body: both the
+/// `tool_use.id` (assistant messages) and the `tool_result.tool_use_id`
+/// (user messages). These ids are a stable, globally-unique conversation
+/// key — the same id cannot belong to two conversations — so they are the
+/// safe way to scope a provider-wide fallback bucket back down to a single
+/// conversation when the client session id is unstable.
+fn collect_request_tool_ids(messages: Option<&[Value]>) -> HashSet<String> {
+    let mut ids = HashSet::new();
+    let Some(messages) = messages else {
+        return ids;
+    };
+    for message in messages {
+        let Some(blocks) = message.get("content").and_then(|c| c.as_array()) else {
+            continue;
+        };
+        for block in blocks {
+            match block.get("type").and_then(|v| v.as_str()) {
+                Some("tool_use") => {
+                    if let Some(id) = block
+                        .get("id")
+                        .and_then(|v| v.as_str())
+                        .filter(|s| !s.is_empty())
+                    {
+                        ids.insert(id.to_string());
+                    }
+                }
+                Some("tool_result") => {
+                    if let Some(id) = block
+                        .get("tool_use_id")
+                        .and_then(|v| v.as_str())
+                        .filter(|s| !s.is_empty())
+                    {
+                        ids.insert(id.to_string());
+                    }
+                }
+                _ => {}
+            }
+        }
+    }
+    ids
 }
 
 fn extract_assistant_tool_use_keys(content: Option<&Value>) -> (HashSet<String>, HashSet<String>) {
@@ -2235,6 +2296,167 @@ mod tests {
         assert_eq!(
             result["contents"][0]["parts"][0]["thought_signature"],
             "sig-lookup"
+        );
+    }
+
+    /// Regression for P1 (Codex review): the provider-wide fallback bucket
+    /// aggregates turns from every session of the provider. When a session
+    /// lookup misses, replay must be scoped back to the current conversation by
+    /// the request's tool-call ids. Without the filter, a name-matched turn from
+    /// ANOTHER conversation could be substituted in — leaking that
+    /// conversation's assistant content and thought signature upstream.
+    #[test]
+    fn shadow_fallback_scopes_replay_to_request_tool_ids() {
+        let store = GeminiShadowStore::with_limits(8, 4);
+        // Conversation A recorded a `search` turn.
+        store.record_assistant_turn(
+            "prov",
+            "session-a",
+            json!({
+                "parts": [{
+                    "functionCall": { "id": "call_a", "name": "search", "args": { "q": "from-A" } }
+                }]
+            }),
+            vec![GeminiToolCallMeta::new(
+                Some("call_a"),
+                "search",
+                json!({ "q": "from-A" }),
+                Some("sig-a"),
+            )],
+        );
+        // Conversation B (same provider) recorded a `get_weather` turn whose
+        // name matches the incoming request's tool name.
+        store.record_assistant_turn(
+            "prov",
+            "session-b",
+            json!({
+                "parts": [{
+                    "functionCall": { "id": "call_b", "name": "get_weather", "args": { "city": "Paris" } }
+                }]
+            }),
+            vec![GeminiToolCallMeta::new(
+                Some("call_b"),
+                "get_weather",
+                json!({ "city": "Paris" }),
+                Some("sig-b"),
+            )],
+        );
+
+        // Current request: session id drifted (`get_session` misses). It calls
+        // `get_weather` with a fresh id that exists in NO recorded turn.
+        let input = json!({
+            "messages": [
+                {
+                    "role": "assistant",
+                    "content": [
+                        { "type": "tool_use", "id": "call_fresh", "name": "get_weather", "input": { "city": "Osaka" } }
+                    ]
+                },
+                {
+                    "role": "user",
+                    "content": [
+                        { "type": "tool_result", "tool_use_id": "call_fresh", "content": "cloudy" }
+                    ]
+                }
+            ]
+        });
+
+        let result = anthropic_to_gemini_with_shadow(
+            input,
+            Some(&store),
+            Some("prov"),
+            Some("session-drifted"),
+        )
+        .unwrap();
+
+        // The fallback must NOT replay conversation B's turn. With the id
+        // filter active, no provider turn shares `call_fresh`, so the assistant
+        // message is converted directly — no foreign content/signature leaks.
+        let parts = result["contents"][0]["parts"].as_array().unwrap();
+        assert_eq!(parts.len(), 1);
+        assert_eq!(parts[0]["functionCall"]["name"], "get_weather");
+        assert_eq!(parts[0]["functionCall"]["args"]["city"], "Osaka");
+        assert!(parts[0].get("thought_signature").is_none());
+    }
+
+    /// P1 regression counterpart: when the drifted request DOES reference a
+    /// recorded tool id, the id-filtered fallback must still recover that turn
+    /// so its original Gemini `functionCall` + thought signature replay intact —
+    /// even when another session of the same provider also exists.
+    #[test]
+    fn shadow_fallback_recovers_own_turn_by_request_tool_id() {
+        let store = GeminiShadowStore::with_limits(8, 4);
+        store.record_assistant_turn(
+            "prov",
+            "session-a",
+            json!({
+                "parts": [{
+                    "functionCall": { "id": "call_a", "name": "get_weather", "args": { "city": "Tokyo" } },
+                    "thought_signature": "sig-a"
+                }]
+            }),
+            vec![GeminiToolCallMeta::new(
+                Some("call_a"),
+                "get_weather",
+                json!({ "city": "Tokyo" }),
+                Some("sig-a"),
+            )],
+        );
+        // Another conversation on the same provider must not interfere.
+        store.record_assistant_turn(
+            "prov",
+            "session-b",
+            json!({
+                "parts": [{
+                    "functionCall": { "id": "call_b", "name": "get_weather", "args": { "city": "Paris" } },
+                    "thought_signature": "sig-b"
+                }]
+            }),
+            vec![GeminiToolCallMeta::new(
+                Some("call_b"),
+                "get_weather",
+                json!({ "city": "Paris" }),
+                Some("sig-b"),
+            )],
+        );
+
+        let input = json!({
+            "messages": [
+                {
+                    "role": "assistant",
+                    "content": [
+                        { "type": "tool_use", "id": "call_a", "name": "get_weather", "input": { "city": "Tokyo" } }
+                    ]
+                },
+                {
+                    "role": "user",
+                    "content": [
+                        { "type": "tool_result", "tool_use_id": "call_a", "content": "sunny" }
+                    ]
+                }
+            ]
+        });
+
+        let result = anthropic_to_gemini_with_shadow(
+            input,
+            Some(&store),
+            Some("prov"),
+            Some("session-drifted"),
+        )
+        .unwrap();
+
+        // Recovered from conversation A (id call_a), not B.
+        assert_eq!(
+            result["contents"][0]["parts"][0]["functionCall"]["name"],
+            "get_weather"
+        );
+        assert_eq!(
+            result["contents"][0]["parts"][0]["functionCall"]["args"]["city"],
+            "Tokyo"
+        );
+        assert_eq!(
+            result["contents"][0]["parts"][0]["thought_signature"],
+            "sig-a"
         );
     }
 

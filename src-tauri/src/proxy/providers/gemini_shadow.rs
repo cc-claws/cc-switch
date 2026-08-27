@@ -91,9 +91,10 @@ struct GeminiShadowInner {
     sessions: HashMap<GeminiShadowKey, GeminiShadowSession>,
     session_order: VecDeque<GeminiShadowKey>,
     /// Provider-scoped recent turns (aggregated across all sessions of a
-    /// provider). Recovered when a session-scoped lookup misses because the
-    /// client session id is unstable, so thought_signature replay state can
-    /// still be restored.
+    /// provider). This is a raw, cross-session bucket — callers MUST narrow it
+    /// back to one conversation (e.g. by the request's tool-call ids) before
+    /// replay, or another session's assistant content / thought signature could
+    /// leak into the current request. See [`GeminiShadowStore::get_recent_turns`].
     provider_recent: HashMap<String, VecDeque<GeminiAssistantTurn>>,
 }
 
@@ -175,7 +176,7 @@ impl GeminiShadowStore {
             let bucket = inner
                 .provider_recent
                 .entry(provider_id.clone())
-                .or_insert_with(VecDeque::new);
+                .or_default();
             bucket.push_back(latest_turn.clone());
             while bucket.len() > self.max_turns_per_session {
                 bucket.pop_front();
@@ -227,12 +228,17 @@ impl GeminiShadowStore {
         snapshot
     }
 
-    /// Read the most recent assistant turns across all sessions of a provider.
+    /// Read the most recent assistant turns across ALL sessions of a provider.
     ///
-    /// This is the fallback for session-scoped lookups when the client session
-    /// id is unstable (a session key recorded earlier no longer matches the
-    /// follow-up request). Replaying these turns still lets the transform layer
-    /// rebuild its `thought_signature` map keyed by `tool_call.id`.
+    /// This is the fallback source for session-scoped lookups when the client
+    /// session id is unstable (a session key recorded earlier no longer matches
+    /// the follow-up request). Because the bucket is provider-wide, callers MUST
+    /// scope the result back to the current conversation before replaying —
+    /// filter by the tool-call ids referenced in the incoming request, which are
+    /// a stable, globally-unique conversation key. Feeding the raw bucket into
+    /// the transform layer would let replay pick another session's turn by tool
+    /// name or position and leak that conversation's content + thought signature
+    /// upstream.
     pub fn get_recent_turns(&self, provider_id: &str) -> Vec<GeminiAssistantTurn> {
         let inner = self.read_inner();
         inner
@@ -470,7 +476,11 @@ mod tests {
         assert_eq!(turns.len(), 2);
         let sigs: Vec<_> = turns
             .iter()
-            .flat_map(|t| t.tool_calls.iter().filter_map(|c| c.thought_signature.as_deref()))
+            .flat_map(|t| {
+                t.tool_calls
+                    .iter()
+                    .filter_map(|c| c.thought_signature.as_deref())
+            })
             .collect();
         assert!(sigs.contains(&"sig-1"));
         assert!(sigs.contains(&"sig-2"));
