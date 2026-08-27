@@ -28,6 +28,14 @@ pub type AnthropicToolSchemaHints = HashMap<String, AnthropicToolSchemaHint>;
 /// to Gemini as `functionResponse.id`.
 pub(crate) const SYNTHESIZED_ID_PREFIX: &str = "gemini_synth_";
 
+/// Google-documented sentinel for `thought_signature` that makes the API skip
+/// signature validation instead of rejecting the request with a 400
+/// ("Function call is missing a thought_signature"). Used when the original
+/// signature cannot be recovered (shadow state lost, session drift, restored
+/// history). See:
+/// https://docs.cloud.google.com/gemini-enterprise-agent-platform/models/thinking/thought-signatures
+const SKIP_THOUGHT_SIGNATURE_VALIDATOR: &str = "skip_thought_signature_validator";
+
 /// Generate a unique tool-call id that is safe to expose to Anthropic clients
 /// but must not be sent upstream to Gemini. Uses UUID v4 simple encoding
 /// (32 lowercase hex chars) so that any number of parallel calls in the same
@@ -763,6 +771,16 @@ fn convert_message_content_to_parts(
                 let mut part = json!({ "functionCall": function_call });
                 if let Some(sig) = thought_signature_by_id.get(id) {
                     part["thought_signature"] = json!(sig);
+                } else {
+                    // Signature unrecoverable (shadow state lost, session
+                    // drift, restored history): an unsigned replayed
+                    // functionCall is rejected by Gemini with a 400, so use
+                    // Google's documented sentinel instead — the API skips
+                    // validation and issues a fresh signature on the next
+                    // turn, keeping the conversation going. Gemini 3 parallel
+                    // calls legitimately carry no signature on non-first
+                    // calls; for them the sentinel is a no-op skip.
+                    part["thought_signature"] = json!(SKIP_THOUGHT_SIGNATURE_VALIDATOR);
                 }
 
                 parts.push(part);
@@ -2372,11 +2390,48 @@ mod tests {
         // The fallback must NOT replay conversation B's turn. With the id
         // filter active, no provider turn shares `call_fresh`, so the assistant
         // message is converted directly — no foreign content/signature leaks.
+        // Without a recoverable signature, the official sentinel is attached so
+        // the request is not rejected with a 400.
         let parts = result["contents"][0]["parts"].as_array().unwrap();
         assert_eq!(parts.len(), 1);
         assert_eq!(parts[0]["functionCall"]["name"], "get_weather");
         assert_eq!(parts[0]["functionCall"]["args"]["city"], "Osaka");
-        assert!(parts[0].get("thought_signature").is_none());
+        assert_eq!(
+            parts[0]["thought_signature"],
+            "skip_thought_signature_validator"
+        );
+    }
+
+    /// When a tool_use cannot be matched to any shadow turn (signature
+    /// unrecoverable), the replayed functionCall must not go out unsigned —
+    /// Gemini rejects unsigned replayed functionCalls with 400. The
+    /// documented sentinel `skip_thought_signature_validator` is attached
+    /// instead, so Gemini skips validation and issues a fresh signature on the
+    /// next turn.
+    #[test]
+    fn unsigned_tool_use_gets_sentinel_thought_signature() {
+        let input = json!({
+            "messages": [
+                {
+                    "role": "assistant",
+                    "content": [
+                        { "type": "tool_use", "id": "call_unknown", "name": "get_weather", "input": { "city": "Osaka" } }
+                    ]
+                },
+                {
+                    "role": "user",
+                    "content": [
+                        { "type": "tool_result", "tool_use_id": "call_unknown", "content": "cloudy" }
+                    ]
+                }
+            ]
+        });
+
+        let result = anthropic_to_gemini(input).unwrap();
+        assert_eq!(
+            result["contents"][0]["parts"][0]["thought_signature"],
+            "skip_thought_signature_validator"
+        );
     }
 
     /// P1 regression counterpart: when the drifted request DOES reference a
